@@ -354,13 +354,15 @@ def run_world(args):
         best_nn = None
 
         for generation in range(generations):
-            for _ in range(100):  # Simulation steps per generation
+            for _ in range(1000):  # Simulation steps per generation
                 world.step()
 
             fitness = world.evaluate()
             if fitness > best_fitness:
                 best_fitness = fitness
                 best_nn = world.copy_nn()
+                best_nn.mutate(MUTATION_RATE)
+
 
             if generation % 100 == 0:
                 logger.info(f"Generation {generation}, Fitness: {fitness}")
@@ -497,4 +499,3 @@ if __name__ == "__main__":
     finally:
 
         logger.info("Program execution completed")
-
