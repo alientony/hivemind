@@ -1,0 +1,404 @@
+import pygame
+import numpy as np
+import math
+import pickle
+import traceback
+import random
+import torch
+
+SCREEN_WIDTH = 1000
+SCREEN_HEIGHT = 800
+BLOCK_SIZE = 20
+WHITE = (255, 255, 255)
+RED = (255, 0, 0)
+GREEN = (0, 255, 0)
+BLUE = (0, 0, 255)
+BLACK = (0, 0, 0)
+
+import torch
+import torch.nn as nn
+
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_size, hidden_sizes, output_size):
+        super(NeuralNetwork, self).__init__()
+        self.input_size = input_size
+        self.hidden_sizes = hidden_sizes
+        self.output_size = output_size
+
+        layers = []
+        prev_size = input_size
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(prev_size, hidden_size))
+            layers.append(nn.ReLU())
+            prev_size = hidden_size
+        layers.append(nn.Linear(prev_size, output_size))
+        
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, X):
+        return self.model(X)
+
+    def set_weights_and_biases(self, weights, biases):
+        with torch.no_grad():
+            for i, (weight, bias) in enumerate(zip(weights, biases)):
+                self.model[i*2].weight.copy_(torch.tensor(weight))
+                self.model[i*2].bias.copy_(torch.tensor(bias))
+
+class Bot:
+    def __init__(self, x: float, y: float, bot_type: str):
+        self.x = x
+        self.y = y
+        self.type = bot_type
+        self.direction = 0
+        self.velocity = 0
+        self.angular_velocity = 0
+        self.max_velocity = 5
+        self.max_angular_velocity = math.pi / 16
+
+    def move(self, action: int):
+        if self.type == "sight":
+            if action == 0:
+                self.angular_velocity = -self.max_angular_velocity
+            elif action == 1:
+                self.angular_velocity = self.max_angular_velocity
+            else:
+                self.angular_velocity = 0
+        else:
+            if action == 0:
+                self.velocity = min(self.velocity + 0.5, self.max_velocity)
+            elif action == 1:
+                self.velocity = max(self.velocity - 0.5, -self.max_velocity)
+            elif action == 2:
+                self.angular_velocity = -self.max_angular_velocity
+            elif action == 3:
+                self.angular_velocity = self.max_angular_velocity
+            else:
+                self.angular_velocity = 0
+
+    def update_position(self):
+        self.direction += self.angular_velocity
+        self.direction %= 2 * math.pi
+
+        self.x += self.velocity * math.cos(self.direction)
+        self.y += self.velocity * math.sin(self.direction)
+
+        self.velocity *= 0.95
+        self.angular_velocity *= 0.95
+
+        self.x = max(0, min(self.x, SCREEN_WIDTH - BLOCK_SIZE))
+        self.y = max(0, min(self.y, SCREEN_HEIGHT - BLOCK_SIZE))
+
+class Block:
+    def __init__(self, x: int, y: int, color: tuple):
+        self.x = x
+        self.y = y
+        self.color = color
+
+class World:
+    def __init__(self):
+        self.sight_bots = []
+        self.movement_bots = []
+        self.blocks = []
+        self.nn = None  # We'll set this when we load the network
+        self.reset()
+
+    def reset(self):
+        self.sight_bots = [Bot(random.uniform(0, SCREEN_WIDTH - BLOCK_SIZE), random.uniform(0, SCREEN_HEIGHT - BLOCK_SIZE), "sight") for _ in range(5)]
+        self.movement_bots = [Bot(random.uniform(0, SCREEN_WIDTH - BLOCK_SIZE), random.uniform(0, SCREEN_HEIGHT - BLOCK_SIZE), "movement") for _ in range(5)]
+        
+        middle_start = SCREEN_WIDTH // 4
+        middle_end = 3 * SCREEN_WIDTH // 4
+        self.blocks = [
+            Block(random.uniform(middle_start, middle_end), random.uniform(0, SCREEN_HEIGHT - BLOCK_SIZE), RED),
+            Block(random.uniform(middle_start, middle_end), random.uniform(0, SCREEN_HEIGHT - BLOCK_SIZE), GREEN),
+            Block(random.uniform(middle_start, middle_end), random.uniform(0, SCREEN_HEIGHT - BLOCK_SIZE), BLUE)
+        ]
+
+    def step(self):
+        try:
+            inputs = self.get_inputs()
+            outputs = self.nn(inputs)
+            
+            # Assume the first 10 outputs are for sight bots (2 per bot)
+            for i, bot in enumerate(self.sight_bots):
+                bot.move(outputs[i*2:(i+1)*2].argmax().item())
+            
+            # Assume the next 20 outputs are for movement bots (4 per bot)
+            for i, bot in enumerate(self.movement_bots):
+                bot.move(outputs[10+i*4:10+(i+1)*4].argmax().item())
+            
+            for bot in self.sight_bots + self.movement_bots:
+                bot.update_position()
+            
+            self.handle_collisions()
+        except Exception as e:
+            print(f"Error in World.step: {str(e)}")
+            traceback.print_exc()
+
+    def handle_collisions(self):
+        for bot in self.movement_bots:
+            for block in self.blocks:
+                if self.check_collision(bot, block):
+                    self.push_block(bot, block)
+
+    def push_block(self, bot: Bot, block: Block):
+        push_force = bot.velocity
+        push_direction = bot.direction
+
+        dx = push_force * math.cos(push_direction)
+        dy = push_force * math.sin(push_direction)
+
+        block.x += dx
+        block.y += dy
+
+        block.x = max(0, min(block.x, SCREEN_WIDTH - BLOCK_SIZE))
+        block.y = max(0, min(block.y, SCREEN_HEIGHT - BLOCK_SIZE))
+
+    def check_collision(self, entity1, entity2):
+        return (abs(entity1.x - entity2.x) < BLOCK_SIZE and
+                abs(entity1.y - entity2.y) < BLOCK_SIZE)
+        
+    def get_inputs(self):
+        inputs = []
+        for bot in self.sight_bots:
+            vision = self.get_bot_vision(bot)
+            inputs.extend(vision)
+        for bot in self.movement_bots:
+            inputs.extend([bot.x / SCREEN_WIDTH, bot.y / SCREEN_HEIGHT])
+        return torch.tensor(inputs, dtype=torch.float32)
+
+
+    def get_bot_vision(self, bot: Bot) -> list:
+        vision = [0] * 5
+        
+        x, y = bot.x + BLOCK_SIZE // 2, bot.y + BLOCK_SIZE // 2
+        dx, dy = math.cos(bot.direction), math.sin(bot.direction)
+        
+        while 0 <= x < SCREEN_WIDTH and 0 <= y < SCREEN_HEIGHT:
+            x += dx * BLOCK_SIZE
+            y += dy * BLOCK_SIZE
+            
+            for block in self.blocks:
+                if block.x <= x < block.x + BLOCK_SIZE and block.y <= y < block.y + BLOCK_SIZE:
+                    if block.color == RED:
+                        vision[0] = 1
+                    elif block.color == GREEN:
+                        vision[1] = 1
+                    elif block.color == BLUE:
+                        vision[2] = 1
+                    return vision
+            
+            for other_bot in self.sight_bots + self.movement_bots:
+                if other_bot.x <= x < other_bot.x + BLOCK_SIZE and other_bot.y <= y < other_bot.y + BLOCK_SIZE:
+                    vision[3] = 1
+                    return vision
+        
+        vision[4] = 1
+        return vision
+
+    def set_nn(self, nn: NeuralNetwork):
+        self.nn = nn
+
+def draw_world(world: World, screen):
+    screen.fill(WHITE)
+    
+    for bot in world.sight_bots + world.movement_bots:
+        color = BLACK if bot.type == "sight" else (150, 150, 150)
+        pygame.draw.rect(screen, color, (int(bot.x), int(bot.y), BLOCK_SIZE, BLOCK_SIZE))
+        
+        direction_color = (100, 100, 100)
+        end_x = bot.x + BLOCK_SIZE // 2 + math.cos(bot.direction) * BLOCK_SIZE
+        end_y = bot.y + BLOCK_SIZE // 2 + math.sin(bot.direction) * BLOCK_SIZE
+        pygame.draw.line(screen, direction_color, 
+                         (int(bot.x + BLOCK_SIZE // 2), int(bot.y + BLOCK_SIZE // 2)),
+                         (int(end_x), int(end_y)), 2)
+    
+    for block in world.blocks:
+        pygame.draw.rect(screen, block.color, (int(block.x), int(block.y), BLOCK_SIZE, BLOCK_SIZE))
+    
+    pygame.display.flip()
+
+import torch
+import pickle
+import numpy as np
+
+def load_neural_network(file_path: str) -> NeuralNetwork:
+    # Load the state dict
+    state_dict = torch.load(file_path, map_location=torch.device('cpu'))
+    
+    # Get the output size from the loaded state dict
+    output_size = state_dict['model.4.weight'].shape[0]
+    
+    # Create a new NeuralNetwork instance with the correct output size
+    nn = NeuralNetwork(input_size=35, hidden_sizes=[64, 32], output_size=output_size)
+    
+    # Load the state dict into the neural network
+    nn.load_state_dict(state_dict)
+    
+    return nn
+
+import pygame
+import pygame.font
+import os
+
+def get_file_list(directory="."):
+    return [f for f in os.listdir(directory) if f.endswith('.pt')]
+
+def draw_text(screen, text, pos, font, color=BLACK):
+    text_surface = font.render(text, True, color)
+    screen.blit(text_surface, pos)
+
+def file_selector(screen, clock):
+    font = pygame.font.Font(None, 32)
+    files = get_file_list()
+    selected = 0
+    scroll_offset = 0
+    
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return None
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_UP:
+                    selected = (selected - 1) % len(files)
+                elif event.key == pygame.K_DOWN:
+                    selected = (selected + 1) % len(files)
+                elif event.key == pygame.K_RETURN:
+                    return files[selected]
+
+        screen.fill(WHITE)
+        draw_text(screen, "Select a neural network file:", (10, 10), font)
+
+        # Adjust scroll offset
+        if selected < scroll_offset:
+            scroll_offset = selected
+        elif selected >= scroll_offset + 20:
+            scroll_offset = selected - 19
+
+        # Draw file list
+        for i, file in enumerate(files[scroll_offset:scroll_offset+20]):
+            color = (255, 0, 0) if i + scroll_offset == selected else BLACK
+            draw_text(screen, file, (10, 50 + i * 30), font, color)
+
+        pygame.display.flip()
+        clock.tick(30)
+
+def visualize_best_performer():
+    pygame.init()
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    pygame.display.set_caption("Bot Evolution Visualization - Best Performer")
+    clock = pygame.time.Clock()
+    font = pygame.font.Font(None, 20)
+
+    try:
+        # File selection
+        file_path = file_selector(screen, clock)
+        if file_path is None:
+            return
+
+        nn = load_neural_network(file_path)
+        world = World()
+        world.set_nn(nn)
+
+        running = True
+        step = 0
+        paused = False
+        show_predictions = True
+
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_SPACE:
+                        paused = not paused
+                    elif event.key == pygame.K_r:
+                        world.reset()
+                        step = 0
+                    elif event.key == pygame.K_p:
+                        show_predictions = not show_predictions
+                    elif event.key == pygame.K_f:
+                        # Return to file selection
+                        file_path = file_selector(screen, clock)
+                        if file_path is None:
+                            running = False
+                        else:
+                            nn = load_neural_network(file_path)
+                            world = World()
+                            world.set_nn(nn)
+                            step = 0
+
+            if not paused:
+                world.step()
+                step += 1
+
+            screen.fill(WHITE)
+            
+            # Get neural network predictions
+            inputs = world.get_inputs()
+            outputs = nn(inputs)
+            
+            # Draw blocks
+            for i, block in enumerate(world.blocks):
+                pygame.draw.rect(screen, block.color, (int(block.x), int(block.y), BLOCK_SIZE, BLOCK_SIZE))
+                if show_predictions:
+                    actual_pos = f"A: ({block.x:.0f}, {block.y:.0f})"
+                    pos_text = font.render(actual_pos, True, BLACK)
+                    screen.blit(pos_text, (int(block.x), int(block.y) + BLOCK_SIZE))
+
+            # Draw bots and predictions
+            for i, bot in enumerate(world.sight_bots + world.movement_bots):
+                color = BLACK if bot.type == "sight" else (150, 150, 150)
+                pygame.draw.rect(screen, color, (int(bot.x), int(bot.y), BLOCK_SIZE, BLOCK_SIZE))
+                
+                # Draw direction
+                end_x = bot.x + BLOCK_SIZE // 2 + math.cos(bot.direction) * BLOCK_SIZE
+                end_y = bot.y + BLOCK_SIZE // 2 + math.sin(bot.direction) * BLOCK_SIZE
+                pygame.draw.line(screen, (100, 100, 100), 
+                                 (int(bot.x + BLOCK_SIZE // 2), int(bot.y + BLOCK_SIZE // 2)),
+                                 (int(end_x), int(end_y)), 2)
+                
+                if show_predictions:
+                    actual_pos = f"A: ({bot.x:.0f}, {bot.y:.0f})"
+                    pos_text = font.render(actual_pos, True, BLACK)
+                    screen.blit(pos_text, (int(bot.x), int(bot.y) + BLOCK_SIZE))
+                    
+                    if bot.type == "sight":
+                        pred_x, pred_y = outputs[i*2:i*2+2].detach().numpy()
+                        pred_pos = f"P: ({pred_x*SCREEN_WIDTH:.0f}, {pred_y*SCREEN_HEIGHT:.0f})"
+                        pred_text = font.render(pred_pos, True, (0, 0, 255))
+                        screen.blit(pred_text, (int(bot.x), int(bot.y) + BLOCK_SIZE + 20))
+
+            # Draw information
+            info_text = [
+                f"File: {file_path}",
+                f"Step: {step}",
+                f"Paused: {'Yes' if paused else 'No'}",
+                f"Show Predictions: {'Yes' if show_predictions else 'No'}",
+                "Controls:",
+                "Space - Pause/Resume",
+                "R - Reset",
+                "P - Toggle Predictions",
+                "F - Select New File"
+            ]
+            for i, text in enumerate(info_text):
+                text_surface = font.render(text, True, BLACK)
+                screen.blit(text_surface, (10, 10 + i * 25))
+
+            pygame.display.flip()
+            clock.tick(30)
+
+            if step >= 1000:
+                world.reset()
+                step = 0
+
+    except Exception as e:
+        print(f"Error in visualization: {str(e)}")
+        traceback.print_exc()
+    finally:
+        pygame.quit()
+    print("Visualization complete.")
+
+if __name__ == "__main__":
+    visualize_best_performer()
+
