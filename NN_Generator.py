@@ -279,7 +279,8 @@ class World:
                 'push_efficiency': 0
             }
         }
-
+        directional_movement_score = 0
+        max_directional_movement_score = 0
         # Define target positions for each color
         targets = [
             (BLUE, 0, 0),
@@ -355,6 +356,39 @@ class World:
             scores['sight_bot_performance']['movement_bot_prediction'] = avg_movement_bot_score * 5
             max_scores['sight_bot_performance']['movement_bot_prediction'] = 5
 
+
+        for movement_bot in self.movement_bots:
+            previous_position = (movement_bot.x - movement_bot.velocity * math.cos(movement_bot.direction),
+                                movement_bot.y - movement_bot.velocity * math.sin(movement_bot.direction))
+
+            for block in self.blocks:
+                previous_distance = self.distance_between_points(previous_position, (block.x, block.y))
+                current_distance = self.distance(movement_bot, block)
+
+                if current_distance < previous_distance:
+                    # Calculate the angle between the bot's movement direction and the direction to the block
+                    direction_to_block = math.atan2(block.y - movement_bot.y, block.x - movement_bot.x)
+                    angle_difference = abs(movement_bot.direction - direction_to_block)
+                    angle_difference = min(angle_difference, 2 * math.pi - angle_difference)
+
+                    # Score based on how closely the bot is moving towards the block
+                    if angle_difference < math.pi / 2:  # Only count if moving generally towards the block
+                        directional_score = (1 - angle_difference / (math.pi / 2)) * (previous_distance - current_distance)
+                        directional_movement_score += directional_score
+
+                max_directional_movement_score += self.distance(movement_bot, block)  # Maximum possible improvement
+
+        # Normalize the directional movement score
+        if max_directional_movement_score > 0:
+            normalized_directional_movement_score = directional_movement_score / max_directional_movement_score
+        else:
+            normalized_directional_movement_score = 0
+
+        # Add the new metric to the scores and max_scores dictionaries
+        scores['movement_bot_performance']['directional_movement'] = normalized_directional_movement_score * 5
+        max_scores['movement_bot_performance']['directional_movement'] = 5
+
+
         # Evaluate movement bots
         movement_bot_proximity = []
         blocks_pushed = 0
@@ -386,7 +420,7 @@ class World:
                                         for k in scores['movement_bot_performance']}
         }
 
-        # Calculate total fitness
+        # Update the total fitness calculation
         total_score = (scores['block_positioning'] +
                       sum(scores['sight_bot_performance'].values()) +
                       sum(scores['movement_bot_performance'].values()))
@@ -397,9 +431,14 @@ class World:
 
         return total_fitness, percentages
 
+    def distance_between_points(self, point1, point2):
+        return ((point1[0] - point2[0]) ** 2 + (point1[1] - point2[1]) ** 2) ** 0.5
 
     def distance(self, entity1, entity2):
         return ((entity1.x - entity2.x) ** 2 + (entity1.y - entity2.y) ** 2) ** 0.5
+
+    def distance_between_points(self, point1, point2):
+        return ((point1[0] - point2[0]) ** 2 + (point1[1] - point2[1]) ** 2) ** 0.5
 
     def copy_nn(self):
         return copy.deepcopy(self.nn)
@@ -558,7 +597,7 @@ def main_single():
                         world.step()
                     fitness, percentages = world.evaluate()
                     total_fitness += fitness
-                    
+
                     if total_percentages is None:
                         total_percentages = percentages
                     else:
@@ -570,7 +609,7 @@ def main_single():
                                 total_percentages[key] += percentages[key]
 
                 avg_fitness = total_fitness / EVALUATIONS_PER_NN
-                avg_percentages = {k: (v / EVALUATIONS_PER_NN if isinstance(v, (int, float)) else 
+                avg_percentages = {k: (v / EVALUATIONS_PER_NN if isinstance(v, (int, float)) else
                                        {sk: sv / EVALUATIONS_PER_NN for sk, sv in v.items()})
                                    for k, v in total_percentages.items()}
 
@@ -594,6 +633,8 @@ def main_single():
                     logger.info("Movement bot performance:")
                     logger.info(f"  Proximity: {avg_percentages['movement_bot_performance']['proximity']:.2f}%")
                     logger.info(f"  Push efficiency: {avg_percentages['movement_bot_performance']['push_efficiency']:.2f}%")
+                    logger.info(f"  Directional movement: {avg_percentages['movement_bot_performance']['directional_movement']:.2f}%")
+
 
             # Dynamic fitness threshold
             fitness_threshold = np.mean(fitness_scores) - 0.5 * np.std(fitness_scores)
@@ -640,7 +681,7 @@ def main_single():
                 parent2 = selection(population_fitness, TOURNAMENT_SIZE)
 
                 child = improved_crossover(parent1, parent2)
-                
+
                 # Adaptive mutation rate
                 total_child_fitness = 0
                 for _ in range(EVALUATIONS_PER_NN):
@@ -652,7 +693,7 @@ def main_single():
                 child_fitness_normalized = (avg_child_fitness - min_fitness) / fitness_range if fitness_range > 0 else 0.5
                 mutation_rate = MUTATION_RATE * (1 - child_fitness_normalized)
                 child.mutate(mutation_rate)
-                
+
                 next_generation.append(child)
 
             population = next_generation
@@ -688,7 +729,7 @@ def improved_crossover(nn1, nn2):
     for param1, param2, new_param in zip(nn1.parameters(), nn2.parameters(), new_nn.parameters()):
         mask = torch.rand_like(new_param) < 0.5
         new_param.data = torch.where(mask, param1.data, param2.data)
-        
+
         # Interpolation
         alpha = torch.rand_like(new_param)
         new_param.data = alpha * param1.data + (1 - alpha) * param2.data
